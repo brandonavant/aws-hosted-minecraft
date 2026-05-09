@@ -1,0 +1,26 @@
+# Backend configuration template for the prod (single) environment.
+#
+# The real prod.hcl is gitignored because the bucket / table / profile values are
+# operator-specific — they identify your own AWS state backend and your local AWS CLI
+# profile. Forks need their own.
+#
+# First-run setup:
+#
+#   cp backend-configs/prod.hcl.example backend-configs/prod.hcl
+#   $EDITOR backend-configs/prod.hcl
+#   terraform init -backend-config=backend-configs/prod.hcl
+#
+# Where to get the values:
+#
+#   bucket          → `terraform output state_bucket_name` in infra/bootstrap/
+#   dynamodb_table  → `terraform output lock_table_name`   in infra/bootstrap/
+#   region          → `terraform output region`            in infra/bootstrap/
+#   profile         → the AWS CLI profile name from `aws configure sso`
+#                     (matches MC_AWS_PROFILE in your .env)
+
+bucket         = "<bootstrap-state-bucket-name>"
+key            = "infra/prod/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "<bootstrap-lock-table-name>"
+encrypt        = true
+profile        = "<aws-cli-profile-name>"

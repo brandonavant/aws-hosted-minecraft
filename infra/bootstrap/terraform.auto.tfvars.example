@@ -1,0 +1,14 @@
+# Copy this file to terraform.auto.tfvars and fill in real values. terraform.auto.tfvars is gitignored.
+#
+#   cp terraform.auto.tfvars.example terraform.auto.tfvars
+#   $EDITOR terraform.auto.tfvars
+
+# Globally unique S3 bucket name for the remote-state backend. Suggested form:
+#   mc-aws-tfstate-<short-random-suffix>
+# The same value must appear in infra/backend-configs/prod.hcl for the main layer.
+state_bucket_name = "mc-aws-tfstate-CHANGEME"
+
+# Optional overrides — defaults match the project's IdC profile and region.
+# region          = "us-east-1"
+# aws_profile     = "mc-aws"
+# lock_table_name = "mc-aws-tfstate-locks"
