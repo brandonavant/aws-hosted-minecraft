@@ -1,6 +1,0 @@
-resource_group_name  = "rg-<team>-<project>-tfstate"
-# The storage account name will be normalized: lowercased, non-alphanumeric characters removed.
-# For example, "stMy-Team_Projecttfstate" becomes "stmyteamprojecttfstate".
-storage_account_name = "st<team><project>tfstate"  # (normalized: lowercased, non-alphanumeric removed)
-container_name       = "tfstate-prod"
-key                  = "prod.tfstate"
