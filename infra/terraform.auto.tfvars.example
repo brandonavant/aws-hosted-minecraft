@@ -1,0 +1,10 @@
+# Copy to terraform.auto.tfvars and override values as needed. terraform.auto.tfvars is gitignored.
+#
+#   cp terraform.auto.tfvars.example terraform.auto.tfvars
+#   $EDITOR terraform.auto.tfvars
+#
+# Defaults match the project's IdC profile and us-east-1 region. Override only if your
+# .env points at a different profile.
+#
+# region      = "us-east-1"
+# aws_profile = "mc-aws"

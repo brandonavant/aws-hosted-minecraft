@@ -238,3 +238,15 @@ terraform.rc
 
 # OS artifacts (optional)
 .DS_Store
+
+# AWS inventory snapshots — operator-specific data (other account IDs in
+# bucket names, DNS records for personal domains, M365 verification tokens,
+# IAM usernames). Generated locally by scripts/aws/inventory.sh; never
+# committed.
+infra/aws-inventory.json
+infra/aws-inventory.*.json
+
+# Real backend configuration — bucket / table / profile names are operator-specific.
+# Only the *.hcl.example template is committed; copy it to *.hcl and fill in your
+# own values from the bootstrap layer's outputs.
+infra/backend-configs/*.hcl
