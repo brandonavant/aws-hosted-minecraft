@@ -11,10 +11,11 @@ any of the steps.
   address.
 - **Storage** — 128 GB LightSail data disk attached at `/dev/xvdf` and mounted at `/srv/minecraft` for the world,
   plugin state, and the Floodgate key.
-- **DNS** — Route 53 A-record pointing a subdomain at the static IP (the live deployment uses
-  `mc.bytehorizonforge.com`; forks override via Terraform variables).
+- **DNS** — Route 53 A-record pointing `<mc_subdomain>.<domain_zone>` (both Terraform variables) at the static IP.
+  The hosted zone must already exist in the account; the stack looks it up via a data source rather than creating it.
 - **Firewall** — Java Edition on TCP 25565, Bedrock Edition on UDP 19132 (IPv4 + IPv6), HTTP on TCP 80, and SSH on
-  TCP 22 with the IPv4 source restricted to LightSail Connect's range.
+  TCP 22 restricted to LightSail Connect's range plus the operator's current public IPv4 (auto-detected via
+  `api.ipify.org` at plan time, or pinned explicitly via `ssh_allowed_cidrs`). IPv6 SSH is intentionally closed.
 - **Backups** — LightSail AutoSnapshot scheduled daily.
 - **Server stack** — Paper (Java edition core), Geyser + Floodgate (Bedrock-client crossplay without separate
   accounts), and ViaVersion (protocol bridging so older clients stay compatible across Mojang version bumps).

@@ -1,10 +1,25 @@
-# Copy to terraform.auto.tfvars and override values as needed. terraform.auto.tfvars is gitignored.
+# Copy to terraform.auto.tfvars and override values as needed. terraform.auto.tfvars is gitignored
+# because domain_zone identifies your live deployment and ssh_allowed_cidrs may reveal your home IP.
 #
 #   cp terraform.auto.tfvars.example terraform.auto.tfvars
 #   $EDITOR terraform.auto.tfvars
-#
-# Defaults match the project's IdC profile and us-east-1 region. Override only if your
-# .env points at a different profile.
-#
+
+# REQUIRED — apex domain of an existing Route 53 hosted zone in this account. The Minecraft A record
+# is placed at "<mc_subdomain>.<domain_zone>". The zone is looked up via a data source; this stack
+# does not create it.
+domain_zone = "example.com"
+
+# Optional — subdomain label for the A record (default: "mc"). The full FQDN becomes
+# "<mc_subdomain>.<domain_zone>".
+# mc_subdomain = "mc"
+
+# Optional — IPv4 CIDRs allowed to reach SSH (port 22), in addition to AWS's lightsail-connect range.
+# When unset (default), the operator's current public IPv4 is auto-detected via api.ipify.org and
+# pinned as a /32 at plan/apply time. Set explicitly to lock in a stable CIDR (e.g., VPN / CI egress)
+# or to avoid the network call on every plan.
+# ssh_allowed_cidrs = ["203.0.113.42/32"]
+
+# Optional — defaults match the project's IdC profile and region. Override only if your .env points
+# at a different profile.
 # region      = "us-east-1"
 # aws_profile = "mc-aws"
