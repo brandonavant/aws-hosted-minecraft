@@ -17,6 +17,22 @@ from unittest import mock
 
 import pytest
 
+from _common import (
+    FLOODGATE_API_BASE,
+    GEYSER_API_BASE,
+    PAPER_API_BASE,
+    ChecksumMismatchError,
+    DownloadError,
+    JarArtifact,
+    _geyser_like_artifact_from_payload,
+    _paper_artifact_from_build_payload,
+    _viaversion_artifact_from_payload,
+    fetch_geyser_like_artifact,
+    fetch_paper_artifact,
+    fetch_viaversion_artifact,
+    read_mc_version_from_history,
+    sha256_of_file,
+)
 from install import (
     CORRETTO_REPO_LINE,
     DEFAULT_DATA_ROOT,
@@ -24,27 +40,20 @@ from install import (
     DEFAULT_HEAP,
     DEFAULT_USER,
     EULA_CONTENT,
-    FLOODGATE_API_BASE,
-    GEYSER_API_BASE,
-    HANGAR_API_BASE,
-    PAPER_API_BASE,
     SYSTEMD_UNIT_NAME,
-    ChecksumMismatchError,
-    DownloadError,
+    UPDATER_SCRIPT_NAME,
     FloodgateKeyMissingError,
+    InstallError,
     InstallPaths,
-    JarArtifact,
     PreflightError,
     VersionDiscoveryError,
-    _geyser_like_artifact_from_payload,
-    _paper_artifact_from_build_payload,
-    _viaversion_artifact_from_payload,
     apt_install,
     apt_packages_installed,
     assert_floodgate_key_present,
     assert_ubuntu_2204,
     assert_volume_mounted,
     build_argument_parser,
+    deploy_updater,
     download_and_place_jar,
     ensure_directory,
     ensure_eula,
@@ -52,16 +61,12 @@ from install import (
     ensure_start_script,
     ensure_systemd_unit,
     ensure_user,
-    fetch_geyser_like_artifact,
-    fetch_paper_artifact,
-    fetch_viaversion_artifact,
+    invoke_updater_install_systemd_units,
     main,
     parse_os_release,
-    read_mc_version_from_history,
     render_start_script,
     render_systemd_unit,
     resolve_versions,
-    sha256_of_file,
     write_file_if_changed,
 )
 
@@ -717,6 +722,81 @@ def test_corretto_repo_line_signed_by_keyring() -> None:
     """The committed apt source line includes ``signed-by=…/corretto-keyring.gpg``."""
     assert "signed-by=/usr/share/keyrings/corretto-keyring.gpg" in CORRETTO_REPO_LINE
     assert "https://apt.corretto.aws stable main" in CORRETTO_REPO_LINE
+
+
+# --- Updater deployment ------------------------------------------------------
+
+
+def test_deploy_updater_copies_both_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first deploy writes both files with the right modes and renames update.py."""
+    source = tmp_path / "src"
+    install_dir = tmp_path / "sbin"
+    source.mkdir()
+    (source / "update.py").write_text("#!/usr/bin/env python3\nprint('updater')\n")
+    (source / "_common.py").write_text("# shared\n")
+    monkeypatch.setattr("install.UPDATER_INSTALL_DIR", install_dir)
+    monkeypatch.setattr("install.UPDATER_SCRIPT_PATH", install_dir / UPDATER_SCRIPT_NAME)
+    changed = deploy_updater(source)
+    assert changed is True
+    target_update = install_dir / UPDATER_SCRIPT_NAME
+    target_common = install_dir / "_common.py"
+    assert target_update.read_text() == "#!/usr/bin/env python3\nprint('updater')\n"
+    assert target_common.read_text() == "# shared\n"
+    assert target_update.stat().st_mode & 0o7777 == 0o755
+    assert target_common.stat().st_mode & 0o7777 == 0o644
+
+
+def test_deploy_updater_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second deploy with identical source content is a no-op."""
+    source = tmp_path / "src"
+    install_dir = tmp_path / "sbin"
+    source.mkdir()
+    (source / "update.py").write_text("body\n")
+    (source / "_common.py").write_text("common\n")
+    monkeypatch.setattr("install.UPDATER_INSTALL_DIR", install_dir)
+    monkeypatch.setattr("install.UPDATER_SCRIPT_PATH", install_dir / UPDATER_SCRIPT_NAME)
+    deploy_updater(source)
+    assert deploy_updater(source) is False
+
+
+def test_deploy_updater_rewrites_on_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Source-content drift causes a rewrite."""
+    source = tmp_path / "src"
+    install_dir = tmp_path / "sbin"
+    source.mkdir()
+    (source / "update.py").write_text("v1\n")
+    (source / "_common.py").write_text("common\n")
+    monkeypatch.setattr("install.UPDATER_INSTALL_DIR", install_dir)
+    monkeypatch.setattr("install.UPDATER_SCRIPT_PATH", install_dir / UPDATER_SCRIPT_NAME)
+    deploy_updater(source)
+    (source / "update.py").write_text("v2\n")
+    assert deploy_updater(source) is True
+    assert (install_dir / UPDATER_SCRIPT_NAME).read_text() == "v2\n"
+
+
+def test_deploy_updater_raises_when_source_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing source file fails loudly rather than silently skipping."""
+    source = tmp_path / "src"
+    install_dir = tmp_path / "sbin"
+    source.mkdir()
+    (source / "update.py").write_text("ok\n")  # _common.py intentionally missing
+    monkeypatch.setattr("install.UPDATER_INSTALL_DIR", install_dir)
+    with pytest.raises(InstallError, match="_common.py"):
+        deploy_updater(source)
+
+
+def test_invoke_updater_install_systemd_units_runs_self_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper shells out the updater with --install-systemd-units."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        "install.run_command",
+        lambda argv, **kw: captured.append(list(argv)) or subprocess.CompletedProcess([], 0),
+    )
+    invoke_updater_install_systemd_units()
+    assert captured and "--install-systemd-units" in captured[0]
+    assert "minecraft-update.py" in captured[0][1]
 
 
 # --- E2E (real APIs) ---------------------------------------------------------

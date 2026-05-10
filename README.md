@@ -14,12 +14,12 @@ infrastructure. Two foundational issues drive the work:
   into Terraform. `terraform plan` is zero-changes against the live deployment.
 - **#5** (closed) — initial state-capture effort. Superseded by #11 once it became clear the deliverable should be
   an executable provisioner, not a captured runbook.
-- **#11** (open) — idempotent Python provisioner under `scripts/server/install.py` that takes a fresh LightSail
+- **#11** (closed) — idempotent Python provisioner under `scripts/server/install.py` that takes a fresh LightSail
   Ubuntu 22.04 instance with the data volume re-attached and produces a running Paper + Geyser + Floodgate +
   ViaVersion crossplay server.
-
-The nightly version-bump updater is a separate, later issue that will consume the same APIs the provisioner
-already speaks (PaperMC Fill v3, Geyser/Floodgate v2, Hangar).
+- **#14** (in flight) — idempotent Python updater under `scripts/server/update.py`, run on a systemd timer, that
+  keeps Geyser / Floodgate / Paper / ViaVersion current so Bedrock clients stay connectable when Mojang ships a
+  protocol bump.
 
 ## What's deployed
 
@@ -44,9 +44,9 @@ forbid importing it) and LightSail snapshots (no Terraform resource exists for t
 | `infra/bootstrap/`  | Terraform layer that provisions the S3 + DynamoDB remote-state backend.            |
 | `infra/`            | Main Terraform layer — imports and manages the live LightSail deployment.          |
 | `scripts/aws/`      | Operator-facing AWS scripts: credential verification, drift inventory.             |
-| `scripts/server/`   | Operator-facing on-host scripts: idempotent provisioner (`install.py`) + tests.    |
+| `scripts/server/`   | On-host scripts: provisioner, updater, `deploy-updater.sh`, tests.                 |
 | `docs/`             | Long-form operator walkthroughs (currently: AWS CLI auth via IAM Identity Center). |
-| `server/`           | Reserved for on-host server state and the future updater (placeholder).            |
+| `server/`           | Reserved for on-host server state captures (placeholder).                          |
 | `.claude/`          | Project rules and skills used by Claude Code.                                      |
 
 Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-setup.md`, carry the detail.
@@ -84,6 +84,14 @@ Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-se
   `bytehorizonforge.com` zone).
 - `terraform fmt -recursive` / `terraform validate` / `terraform plan` — routine Terraform hygiene. `apply` and
   `destroy` are operator-only.
+- `scripts/server/update.py --help` — the on-host updater (lands at `/usr/local/sbin/minecraft-update.py`). Runs
+  daily under `minecraft-update.timer` (fires at `*-*-* 10:00:00 UTC` with a `RandomizedDelaySec=3600` jitter —
+  ~5 AM CDT, genuine off-peak). Sha256-driven: skips when on-disk jars match the API. Refuses to bump Paper
+  across MC versions, never touches `plugins/floodgate/key.pem`.
+- `scripts/server/deploy-updater.sh --help` — operator-side script for the existing hand-built live host. Reads
+  `.env` for SSH details, rsyncs `update.py` + `_common.py` to `/usr/local/sbin/`, then invokes the updater's
+  `--install-systemd-units` mode to drop the timer + service units. Idempotent end-to-end. Use this rather than
+  re-running `install.py` against a host that was never tested with the provisioner.
 
 ## License
 
