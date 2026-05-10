@@ -34,7 +34,7 @@ variable "tags" {
   description = "Tags applied to every resource the bootstrap layer manages."
   type        = map(string)
   default = {
-    Project   = "azure-hosted-minecraft"
+    Project   = "aws-hosted-minecraft"
     Component = "tf-bootstrap"
     ManagedBy = "terraform"
   }
