@@ -56,8 +56,10 @@ layer for the first time. **The agent must stop at every operator-owned step**, 
 
 ## AWS authentication
 
-- Account `444672861827`, region `us-east-1`, profile `mc-aws` (IAM Identity Center, `AdministratorAccess`
-  permission set). Pass `--profile mc-aws` or set `AWS_PROFILE=mc-aws` for every `aws` / `terraform` invocation.
+- Region `us-east-1`, profile `mc-aws` (IAM Identity Center, `AdministratorAccess` permission set). Pass
+  `--profile mc-aws` or set `AWS_PROFILE=mc-aws` for every `aws` / `terraform` invocation. The account ID lives
+  in operator-local config (`.env` / SSO cache); recover it on demand via `aws sts get-caller-identity` if you
+  need it.
 - The cached SSO token at `~/.aws/sso/cache/` typically expires every 8–12 hours. Recovery: `aws sso login
   --profile mc-aws`.
 - `MC_AWS_PROFILE=mc-aws` lives in the gitignored `.env`. See `docs/aws-auth-setup.md` for the full IdC walkthrough
