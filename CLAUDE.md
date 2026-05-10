@@ -2,112 +2,122 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project context
+## Commands
 
-The live deployment is on **AWS LightSail**. An earlier Azure backend (PR #2) was scrapped and the repo was reset
-on 2026-05-09 to reverse-engineer a hand-built LightSail Minecraft deployment into Terraform (issue #4, merged in
-PR #9). The repo was originally named `azure-hosted-minecraft` and renamed to `aws-hosted-minecraft` on 2026-05-09;
-historical commits, PR titles, and issue bodies may still mention Azure or the old name.
+### Python tests
 
-The eventual goal is idempotent scripts that can rebuild or repair the live server, plus a Python nightly updater
-for Paper / Geyser / Floodgate version bumps. The updater is deliberately not designed yet — it waits on issue #4
-(closed — Terraform import) and issue #5 (open — server-state capture from the live host), so its requirements
-are shaped by what those uncover.
+Run all unit tests from the repo root (pytest discovers `scripts/` via `pyproject.toml`):
+
+```bash
+pytest
+```
+
+Run a single test file or test:
+
+```bash
+pytest scripts/server/test_install.py
+pytest scripts/server/test_update.py::test_name
+```
+
+Run e2e tests that hit real external APIs (PaperMC Fill v3, Geyser/Floodgate v2, Hangar):
+
+```bash
+pytest --run-e2e
+```
+
+Format Python code (line length is 120, configured in `pyproject.toml`):
+
+```bash
+black scripts/server/
+```
+
+Lint shell scripts:
+
+```bash
+shellcheck scripts/server/deploy-updater.sh scripts/aws/verify-credentials.sh scripts/aws/inventory.sh
+```
+
+### Terraform
+
+Run from `infra/` (main layer) or `infra/bootstrap/` (bootstrap layer):
+
+```bash
+terraform fmt -recursive
+terraform validate
+terraform plan
+```
+
+`terraform apply` and `terraform destroy` are **operator-only** — never run them as an agent.
 
 ## Architecture
 
-The Terraform stack lives in two layers under `infra/`:
+### Two Terraform layers
 
-- **`infra/bootstrap/`** — provisions the S3 bucket + DynamoDB lock table that hold the main layer's remote state.
-  Has **no `backend` block**; its own state lives on the operator's laptop. This solves the chicken-and-egg of
-  bootstrapping its own state backend. Re-running this layer is rare (recovery scenarios only — see its README).
-- **`infra/`** — the main layer. Manages the live LightSail Minecraft deployment via an S3 backend whose values
-  come from `backend-configs/prod.hcl` (gitignored; the operator copies `prod.hcl.example` and fills in bucket /
-  lock-table / profile from the bootstrap layer's outputs).
+`infra/bootstrap/` creates the S3 bucket and DynamoDB table for remote state. It has no backend block (state lives on
+the operator's machine). `infra/` is the main layer; it uses the bootstrap layer's outputs as its S3 backend. Run
+bootstrap first on a fresh AWS account; subsequent infra work goes entirely in `infra/`.
 
-The main layer was authored by importing existing AWS resources, so `terraform plan` is zero changes for everything
-it manages. See `infra/README.md` for the full import map and the deliberately-not-imported resources:
-`aws_lightsail_instance_public_ports.mcserver` (provider gap — applied as a no-op to enter state), the
-`ssh-mcserver` key pair (the AWS provider docs explicitly forbid importing), LightSail snapshots (no provider
-resource exists), and the `bytehorizonforge.com` Route 53 zone — that one is a `data` source on purpose because it
-pre-existed this project and hosts unrelated Azure M365 records (`auth.bytehorizonforge.com`).
+### Three on-host Python scripts
 
-### File-per-concern Terraform layout
+All three scripts are stdlib-only (no pip-installable dependencies). They run as root on the LightSail host.
 
-No `main.tf` — ever. Resources are split by domain: `providers.tf`, `variables.tf`, `outputs.tf`, plus per-domain
-files (`lightsail.tf`, `networking.tf`, `storage.tf`, `dns.tf`). `infra/bootstrap/` follows the same pattern
-(`s3.tf`, `dynamodb.tf`). Modules under `infra/modules/<name>/` are acceptable only when a real reuse boundary
-appears — do not pre-extract speculatively. If a future PR proposes a `main.tf` or speculative module, push back.
+| Script                      | Role                                                                                                                                                                                                                                                 |
+|-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `scripts/server/_common.py` | Shared artifact fetchers (PaperMC Fill v3, Geyser/Floodgate v2, Hangar v1), HTTP helpers, sha256 utils, and on-disk version discovery. No side effects at import time.                                                                               |
+| `scripts/server/install.py` | One-time host provisioner. Installs Corretto JDK via apt, creates the `minecraft` user/group, downloads Paper + Geyser + Floodgate + ViaVersion, writes systemd units, and deploys the updater. Requires root and a mounted data volume.             |
+| `scripts/server/update.py`  | Nightly updater. Compares on-disk jar sha256 against the API's latest; downloads, atomically swaps, restarts the service, and rolls back on restart failure. Installed to `/usr/local/sbin/minecraft-update.py`; driven by `minecraft-update.timer`. |
 
-## Operator vs. agent split (Terraform)
+`install.py` and `update.py` import `_common.py` as a sibling module — both scripts must live in the same directory at
+runtime. `deploy-updater.sh` renames `update.py` → `minecraft-update.py` when deploying to the live host, then places
+`_common.py` beside it.
 
-The agent runs routine, low-risk Terraform commands. The operator runs anything that mutates AWS or initializes a
-layer for the first time. **The agent must stop at every operator-owned step**, even if the plan looks safe.
+### Data volume layout (`/srv/minecraft`)
 
-| Command                           | Owner    |
-|-----------------------------------|----------|
-| First `terraform init` per layer  | Operator |
-| Subsequent `terraform init`       | Agent    |
-| `terraform validate` / `fmt`      | Agent    |
-| `terraform plan`                  | Agent    |
-| `terraform import`                | Agent    |
-| `terraform state rm` / `state mv` | Agent    |
-| `terraform apply` / `destroy`     | Operator |
-
-## AWS authentication
-
-- Region `us-east-1`, profile `mc-aws` (IAM Identity Center, `AdministratorAccess` permission set). Pass
-  `--profile mc-aws` or set `AWS_PROFILE=mc-aws` for every `aws` / `terraform` invocation. The account ID lives
-  in operator-local config (`.env` / SSO cache); recover it on demand via `aws sts get-caller-identity` if you
-  need it.
-- The cached SSO token at `~/.aws/sso/cache/` typically expires every 8–12 hours. Recovery: `aws sso login
-  --profile mc-aws`.
-- `MC_AWS_PROFILE=mc-aws` lives in the gitignored `.env`. See `docs/aws-auth-setup.md` for the full IdC walkthrough
-  (Checkpoints A–F); `.env.example` lists every required key (also `MC_SSH_HOST`, `MC_SSH_USER`, `MC_SSH_KEY` for
-  reaching the live host).
-
-## Common commands
-
-```bash
-# Verify AWS CLI auth (read-only; run before anything that touches AWS).
-./scripts/aws/verify-credentials.sh
-
-# Snapshot every AWS resource the deployment depends on (drift detection).
-./scripts/aws/inventory.sh   # writes infra/aws-inventory.json (gitignored)
-
-# Bootstrap layer (rare — only on first setup or laptop recovery).
-cd infra/bootstrap && terraform fmt -recursive && terraform validate && terraform plan
-
-# Main layer.
-cd infra && terraform init -backend-config=backend-configs/prod.hcl
-terraform fmt -recursive && terraform validate && terraform plan   # plan must be zero changes
-
-# Lint shell scripts (project requires shellcheck-clean).
-shellcheck scripts/aws/*.sh
-
-# Python formatter (line-length 120 from pyproject.toml). Project requires Python 3.13+.
-black .
+```
+/srv/minecraft/
+└── server/
+    ├── paper.jar
+    ├── start.sh
+    ├── eula.txt
+    ├── version_history.json     # Paper writes this on first start; both scripts read it for MC version
+    └── plugins/
+        ├── Geyser-Spigot.jar
+        ├── Floodgate-Spigot.jar
+        ├── ViaVersion.jar
+        └── floodgate/
+            └── key.pem          # NEVER touched by install.py or update.py
 ```
 
-There are no Python files yet — `server/` and `docs/` only contain `.gitkeep` placeholders plus the AWS auth doc.
+### Deploy workflow
 
-## Public-repo hygiene
+For an existing host (where re-running `install.py` is undesired), push updater changes via:
 
-This is a public GitHub repo. Never commit, paste into PR descriptions, or echo to logs:
+```bash
+./scripts/server/deploy-updater.sh   # reads SSH details from .env
+```
 
-- The AWS account ID (12 digits) — redact to `<account-id>` or `<redacted>`. The inventory script already redacts.
-- Real `.env` values: SSH host / user / PEM path, `MC_AWS_PROFILE` if it identifies the operator.
-- `infra/backend-configs/*.hcl` (only `*.hcl.example` is committed).
-- `infra/aws-inventory.json` (operator-specific data — cross-account bucket names, personal-domain DNS records,
-  M365 verification tokens, IAM usernames — even with the account ID redacted).
-- Anything from `~/.aws/`, including SSO start URLs.
+The script rsyncs `update.py` + `_common.py`, renames `update.py` → `minecraft-update.py` with `sudo install`, then
+invokes `--install-systemd-units` on the host.
 
-`.env`, `*.pem`, `*.tfvars`, real `*.hcl` backend configs, and the inventory snapshot are already gitignored.
+## Hard constraints
 
-## Project rules
+- **`plugins/floodgate/key.pem` is never written.** Both `install.py` and `update.py` check this as an invariant.
+  Regenerating the key breaks Bedrock auth for every existing player.
+- **Paper is never bumped across Minecraft versions.** `update.py` clamps Paper to the running MC version's build
+  stream. Moving MC versions requires re-running `install.py` with `--mc-version`.
+- **All downloads are sha256-verified** before being placed. The API's reported hash is compared against the downloaded
+  bytes; mismatches delete the download and raise `ChecksumMismatchError`.
+- **Bash scripts target macOS bash 3.2**: no `mapfile`, no `${var,,}`, no associative arrays.
 
-Topic-specific instructions live in `.claude/rules/` and load alongside this file. They cover Terraform conventions,
-Python style, line length (120 char wrap in `.md` / `.py` / `.tf` / `.tfvars` / `.hcl` / `.yml` / `.yaml` / `.sh`),
-dependency vetting via the `vet-dependency` skill, scripted infrastructure setup (no prose-recipe operator steps —
-ship a script under `scripts/`), harness-format enforcement, external-API grounding, and skill matching on
-redirected intent. Read the relevant rule before touching the matching file type or planning operator-facing work.
+## `.env` setup
+
+Copy `.env.example` to `.env` and fill in:
+
+```
+MC_SSH_HOST   # LightSail static IP or DNS name
+MC_SSH_USER   # SSH user (default: ubuntu)
+MC_SSH_KEY    # Path to PEM private key
+MC_AWS_PROFILE # AWS SSO profile name (see docs/aws-auth-setup.md)
+```
+
+`scripts/aws/verify-credentials.sh` validates the AWS profile; run it whenever AWS calls fail.

@@ -13,6 +13,17 @@ resource "aws_lightsail_instance" "mcserver" {
   }
 }
 
+# Operator's current public IPv4, fetched only when var.ssh_allowed_cidrs is empty.
+# Used to populate the SSH allowlist with a /32 of the host running terraform.
+data "http" "operator_ip" {
+  count = length(var.ssh_allowed_cidrs) > 0 ? 0 : 1
+  url   = "https://api.ipify.org"
+}
+
+locals {
+  ssh_allowed_cidrs = length(var.ssh_allowed_cidrs) > 0 ? var.ssh_allowed_cidrs : ["${chomp(data.http.operator_ip[0].response_body)}/32"]
+}
+
 resource "aws_lightsail_instance_public_ports" "mcserver" {
   instance_name = aws_lightsail_instance.mcserver.name
 
@@ -45,12 +56,14 @@ resource "aws_lightsail_instance_public_ports" "mcserver" {
     ipv6_cidrs = ["::/0"]
   }
 
+  # SSH is restricted to AWS's lightsail-connect range plus the operator's current IPv4 (or
+  # var.ssh_allowed_cidrs when set). IPv6 SSH is intentionally not opened — dualstack would otherwise
+  # widen this rule to every IPv6 host on the internet.
   port_info {
     protocol          = "tcp"
     from_port         = 22
     to_port           = 22
-    cidrs             = ["198.148.30.0/32"]
-    ipv6_cidrs        = ["::/0"]
+    cidrs             = local.ssh_allowed_cidrs
     cidr_list_aliases = ["lightsail-connect"]
   }
 }

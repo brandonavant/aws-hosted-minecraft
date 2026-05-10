@@ -71,11 +71,12 @@ terraform import aws_lightsail_disk.mcserver_data              disk-mcserver-pro
 terraform import aws_lightsail_disk_attachment.mcserver_data   'disk-mcserver-prod,mcserver-prod'
 terraform import aws_lightsail_static_ip.mcserver              ip-mcserver-prod
 terraform import aws_lightsail_static_ip_attachment.mcserver   ip-mcserver-prod
-terraform import aws_route53_record.mc                         'Z09024551TI8L9018Y7IE_mc.bytehorizonforge.com_A'
+terraform import aws_route53_record.mc                         '<zone-id>_<mc_subdomain>.<domain_zone>_A'
 ```
 
-The `bytehorizonforge.com` Route 53 zone is **not** imported — it is read via a `data` source instead. See
-[Why the bytehorizonforge zone is a data source](#why-the-bytehorizonforge-zone-is-a-data-source).
+Substitute your own zone ID (from the Route 53 console) and the values you set for `mc_subdomain` and
+`domain_zone` in `terraform.auto.tfvars`. The hosted zone itself is **not** imported — it is read via a `data`
+source instead. See [Why the hosted zone is a data source](#why-the-hosted-zone-is-a-data-source).
 
 ## Resources that can't be imported
 
@@ -94,28 +95,28 @@ state. Each is handled deliberately:
   `aws_lightsail_instance_snapshot` resource at all. Existing snapshots live in AWS independently of Terraform; the
   AutoSnapshot add-on on the instance creates new ones daily as configured (`snapshot_time = "11:00"` UTC).
 
-## Why the bytehorizonforge zone is a data source
+## Why the hosted zone is a data source
 
-The `bytehorizonforge.com.` zone pre-existed this project and hosts records for unrelated concerns — specifically
-an Azure M365 email setup at `auth.bytehorizonforge.com.` (MX, TXT, two DKIM CNAMEs). The Minecraft Terraform does
-**not** own that zone; it merely places one record (`mc.bytehorizonforge.com.`) inside it.
+The zone named by `var.domain_zone` is typically shared with other concerns (e.g., email/MX/TXT/DKIM records for
+the same apex domain). The Minecraft Terraform does **not** own that zone; it merely places one record
+(`<mc_subdomain>.<domain_zone>.`) inside it.
 
 Expressing that with a `data "aws_route53_zone"` block instead of `resource "aws_route53_zone"` keeps the ownership
 boundary truthful: Terraform looks up the zone, but cannot create it, modify it, or destroy it. Zone-level
 attributes (NS, SOA, comment, tags) and unrelated records are entirely outside this stack's reach.
 
-If the zone ever becomes Minecraft-only (e.g., the Azure email records are retired or migrated), the data source
-can be flipped to a resource block by replacing `data "aws_route53_zone"` with `resource "aws_route53_zone"`,
-adding it to state via `terraform import aws_route53_zone.bytehorizonforge <zone_id>`, and updating the `aws_route53_record.mc`
-reference from `data.…` to `aws_route53_zone.bytehorizonforge.zone_id`.
+If your zone ever becomes Minecraft-only, the data source can be flipped to a resource block by replacing
+`data "aws_route53_zone"` with `resource "aws_route53_zone"`, adding it to state via
+`terraform import aws_route53_zone.mc <zone_id>`, and updating the `aws_route53_record.mc` reference from
+`data.…` to `aws_route53_zone.mc.zone_id`.
 
 ## Drift detection
 
 The primary drift signal is `terraform plan` against the imported state — when something has changed in AWS that
 Terraform manages, plan will show it.
 
-For drift in resources Terraform **doesn't** manage (e.g., the LightSail key pair, instance snapshots, the
-unrelated `auth.*` records in the `bytehorizonforge.com` zone), the inventory script is the cross-check:
+For drift in resources Terraform **doesn't** manage (e.g., the LightSail key pair, instance snapshots, any
+unrelated records sharing the Route 53 zone), the inventory script is the cross-check:
 
 ```bash
 # Keep a local baseline once you're at a known-good state.
@@ -127,9 +128,9 @@ cp infra/aws-inventory.json infra/aws-inventory.baseline.json
 diff infra/aws-inventory.baseline.json infra/aws-inventory.json
 ```
 
-Both files are gitignored — the snapshot pulls in operator-specific data (cross-account bucket names, personal
-domain DNS records, Azure M365 verification tokens, IAM usernames) that doesn't belong in a public repo even with
-the AWS account ID redacted.
+Both files are gitignored — the snapshot pulls in operator-specific data (cross-account bucket names, DNS records
+for shared zones, email-provider verification tokens, IAM usernames) that doesn't belong in a public repo even
+with the AWS account ID redacted.
 
 ## Tags
 
@@ -142,12 +143,12 @@ expected.
 
 | File              | Concern                                                                |
 |-------------------|------------------------------------------------------------------------|
-| `providers.tf`    | Terraform + AWS provider version pins; S3 backend block.               |
-| `variables.tf`    | `region`, `aws_profile`.                                               |
-| `lightsail.tf`    | LightSail instance + firewall rules.                                   |
+| `providers.tf`    | Terraform + AWS + http provider version pins; S3 backend block.        |
+| `variables.tf`    | `region`, `aws_profile`, `domain_zone`, `mc_subdomain`, `ssh_allowed_cidrs`. |
+| `lightsail.tf`    | LightSail instance + firewall rules (incl. dynamic SSH allowlist).     |
 | `storage.tf`      | Attached data disk + disk attachment.                                  |
 | `networking.tf`   | Static IP + IP-to-instance attachment.                                 |
-| `dns.tf`          | `bytehorizonforge.com` Route 53 zone + `mc.` A record.                 |
+| `dns.tf`          | Route 53 zone data lookup + `<mc_subdomain>.<domain_zone>` A record.   |
 | `outputs.tf`      | Public IP, DNS name, name servers.                                     |
 | `backend-configs/prod.hcl.example` | Template for the operator's gitignored `prod.hcl`.    |
 | `aws-inventory.json` | Local-only AWS-state snapshot (gitignored). Generated by `scripts/aws/inventory.sh`. |
