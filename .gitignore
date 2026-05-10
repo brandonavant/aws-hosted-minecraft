@@ -246,6 +246,13 @@ terraform.rc
 infra/aws-inventory.json
 infra/aws-inventory.*.json
 
+# Live-host state capture — operator-specific data (internal AWS hostname,
+# block-storage UUIDs, sudoers layout, plugin sha256 fingerprints, plugin
+# config files verbatim including the redacted-but-still-sensitive Geyser
+# and Floodgate sections). Kept locally as an input reference for
+# scripts/server/install.py; never committed.
+server/state.md
+
 # Real backend configuration — bucket / table / profile names are operator-specific.
 # Only the *.hcl.example template is committed; copy it to *.hcl and fill in your
 # own values from the bootstrap layer's outputs.

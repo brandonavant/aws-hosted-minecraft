@@ -12,12 +12,14 @@ infrastructure. Two foundational issues drive the work:
 - **#4** (closed,
   [PR #9](https://github.com/brandonavant/aws-hosted-minecraft/pull/9)) — AWS LightSail infrastructure imported
   into Terraform. `terraform plan` is zero-changes against the live deployment.
-- **#5** (open) — capture and document the Minecraft server's on-host state (file layout, systemd service, world
-  data, Paper / Geyser / Floodgate versions) so the eventual Python updater can repair or rebuild a server from
-  scratch.
+- **#5** (closed) — initial state-capture effort. Superseded by #11 once it became clear the deliverable should be
+  an executable provisioner, not a captured runbook.
+- **#11** (open) — idempotent Python provisioner under `scripts/server/install.py` that takes a fresh LightSail
+  Ubuntu 22.04 instance with the data volume re-attached and produces a running Paper + Geyser + Floodgate +
+  ViaVersion crossplay server.
 
-Server-side bootstrap (cloud-init, plugin install, world bind-mount, systemd unit) and the nightly version-bump
-updater come after #5 closes.
+The nightly version-bump updater is a separate, later issue that will consume the same APIs the provisioner
+already speaks (PaperMC Fill v3, Geyser/Floodgate v2, Hangar).
 
 ## What's deployed
 
@@ -42,6 +44,7 @@ forbid importing it) and LightSail snapshots (no Terraform resource exists for t
 | `infra/bootstrap/`  | Terraform layer that provisions the S3 + DynamoDB remote-state backend.            |
 | `infra/`            | Main Terraform layer — imports and manages the live LightSail deployment.          |
 | `scripts/aws/`      | Operator-facing AWS scripts: credential verification, drift inventory.             |
+| `scripts/server/`   | Operator-facing on-host scripts: idempotent provisioner (`install.py`) + tests.    |
 | `docs/`             | Long-form operator walkthroughs (currently: AWS CLI auth via IAM Identity Center). |
 | `server/`           | Reserved for on-host server state and the future updater (placeholder).            |
 | `.claude/`          | Project rules and skills used by Claude Code.                                      |
@@ -59,9 +62,16 @@ Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-se
    outputs, then `terraform init -backend-config=backend-configs/prod.hcl`. The committed `.tf` files match the
    shape of the existing live deployment, so the import path documented in `infra/README.md` is the supported one
    today; a clean greenfield apply has not been exercised and may surface differences that need to be reconciled.
+4. **Provision the host** — once Terraform has stood up the LightSail instance and the data volume is attached
+   and mounted at `/srv/minecraft`, SSH in and run the provisioner:
 
-The eventual server-side install path (cloud-init / Paper / Geyser / Floodgate / systemd) is intentionally
-out-of-scope until issue #5 closes — that issue's audit dictates what the install scripts will need to reproduce.
+   ```bash
+   sudo python3 scripts/server/install.py --help
+   ```
+
+   The script is idempotent (re-runs are no-ops when state matches), pins Paper / Geyser / Floodgate / ViaVersion
+   versions via flags (defaulting to the volume's existing state), and refuses to regenerate the Floodgate key
+   unless `--allow-fresh-floodgate-key` is passed. See the script's docstring and `--dry-run` for details.
 
 ## Operating the live server
 
