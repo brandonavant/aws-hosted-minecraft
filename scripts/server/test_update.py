@@ -313,6 +313,51 @@ def _write_paper_history(paths: UpdatePaths, mc: str, build: int) -> None:
     )
 
 
+def test_build_plan_uses_modern_paper_history_without_crossing_minecraft_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan a Paper update using the Minecraft version recorded by the current server.
+
+    Args:
+        tmp_path: Temporary data-volume root.
+        monkeypatch: Pytest helper for replacing the artifact fetcher.
+    """
+    paths = _make_paths(tmp_path)
+    paths.jar_for(COMPONENT_PAPER).write_bytes(b"installed paper")
+    (paths.server_dir / "version_history.json").write_text(
+        '{"currentVersion":"1.21.11-69-94d0c97 (MC: 1.21.11)"}', encoding="utf-8"
+    )
+    requested_versions: list[object] = []
+    artifact = JarArtifact(
+        label="paper",
+        version="1.21.11-70",
+        download_url="https://example.test/paper.jar",
+        sha256="f" * 64,
+        filename="paper.jar",
+    )
+
+    def fake_fetch(component: str, overrides: dict[str, object]) -> JarArtifact:
+        """Return a Paper artifact while recording the requested Minecraft version.
+
+        Args:
+            component: Requested component.
+            overrides: Artifact lookup options.
+
+        Returns:
+            The prepared Paper artifact.
+        """
+        assert component == COMPONENT_PAPER
+        requested_versions.append(overrides["paper_mc_version"])
+        return artifact
+
+    monkeypatch.setattr("update.fetch_artifact_for", fake_fetch)
+    plans = build_plan([COMPONENT_PAPER], paths, {}, force=False)
+    assert requested_versions == ["1.21.11"]
+    assert len(plans) == 1
+    assert plans[0].installed_version == "1.21.11-69"
+    assert plans[0].action == "apply"
+
+
 def test_build_plan_skips_when_sha_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """When the on-disk jar's sha matches the API's, the component plans ``skip``."""
     paths = _make_paths(tmp_path)
@@ -387,17 +432,12 @@ def test_build_plan_paper_clamp_rejects_cross_mc(tmp_path: Path, monkeypatch: py
     paths = _make_paths(tmp_path)
     paths.paper_jar.write_bytes(b"paper-1.21.8-58")
     _write_paper_history(paths, "1.21.8", 58)
-    # API returns a Paper build for 1.21.9 — the function calls assert_paper_same_mc with installed_mc
-    # for BOTH inputs (the installed MC is the only allowed MC for the URL). But the artifact's version
-    # might still report a different stream; the clamp is enforced via the call shape. To verify the
-    # clamp behavior, we directly exercise assert_paper_same_mc above. Here, just verify the plan
-    # call succeeds when the API is on the same MC.
     artifact = JarArtifact(
         label="paper",
-        version="1.21.8-60",
+        version="1.21.9-60",
         download_url="https://example/p.jar",
         sha256="ee" * 32,
-        filename="paper-1.21.8-60.jar",
+        filename="paper-1.21.9-60.jar",
     )
 
     def fake_fetch(component: str, overrides: dict) -> JarArtifact:
@@ -405,9 +445,24 @@ def test_build_plan_paper_clamp_rejects_cross_mc(tmp_path: Path, monkeypatch: py
         return artifact
 
     monkeypatch.setattr("update.fetch_artifact_for", fake_fetch)
-    plans = build_plan([COMPONENT_PAPER], paths, {}, force=False)
-    assert plans[0].action == "apply"
-    assert plans[0].artifact.version == "1.21.8-60"
+    with pytest.raises(PaperMcVersionMismatchError, match="cross-MC"):
+        build_plan([COMPONENT_PAPER], paths, {}, force=False)
+
+
+def test_build_plan_rejects_paper_downgrades_even_when_forced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent a hash mismatch or force flag from selecting an older Paper build.
+
+    Args:
+        tmp_path: Temporary data-volume root.
+        monkeypatch: Pytest helper for replacing the artifact fetcher.
+    """
+    paths = _make_paths(tmp_path)
+    paths.paper_jar.write_bytes(b"newer paper")
+    _write_paper_history(paths, "1.21.11", 100)
+    artifact = JarArtifact("paper", "1.21.11-99", "https://example.test/paper.jar", "f" * 64, "paper.jar")
+    monkeypatch.setattr("update.fetch_artifact_for", lambda component, overrides: artifact)
+    with pytest.raises(UpdateError, match="refusing to downgrade"):
+        build_plan([COMPONENT_PAPER], paths, {}, force=True)
 
 
 def test_build_plan_paper_skipped_when_no_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,9 +816,7 @@ def test_main_returns_zero_on_install_systemd_units(monkeypatch: pytest.MonkeyPa
     assert main(["--install-systemd-units"]) == 0
 
 
-def test_update_returns_zero_when_components_swapped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_update_returns_zero_when_components_swapped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful run with N applied updates returns 0, not N.
 
     Regression: an earlier version of ``update()`` propagated ``apply_plans``'s count as its return

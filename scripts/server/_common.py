@@ -18,9 +18,10 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,10 +37,19 @@ USER_AGENT = "aws-hosted-minecraft/0.1 (+https://github.com/brandonavant/aws-hos
 PAPER_DOWNLOAD_KEY = "server:default"
 GEYSER_LIKE_DOWNLOAD_KEY = "spigot"
 HANGAR_DOWNLOAD_PLATFORM = "PAPER"
+MULTIVERSE_PROJECTS: dict[str, tuple[str, str]] = {
+    "core": ("Multiverse-Core", "Multiverse-Core.jar"),
+    "inventories": ("Multiverse-Inventories", "Multiverse-Inventories.jar"),
+    "portals": ("Multiverse-Portals", "Multiverse-Portals.jar"),
+}
 
 VERSION_HISTORY_FILE = "version_history.json"
-_VERSION_HISTORY_RE = re.compile(r'"currentVersion"\s*:\s*"git-Paper-(?P<build>\d+)\s*\(MC:\s*(?P<mc>[^)]+)\)"')
+_VERSION_HISTORY_PATTERNS = (
+    re.compile(r"git-Paper-(?P<build>\d+)\s*\(MC:\s*(?P<mc>[^)]+)\)"),
+    re.compile(r"(?P<declared_mc>[^ ()]+)-(?P<build>\d+)-[0-9a-fA-F]+\s*\(MC:\s*(?P<mc>[^)]+)\)"),
+)
 _PLUGIN_YML_VERSION_RE = re.compile(r"^version:\s*(?P<version>.+?)\s*$", re.MULTILINE)
+_HANGAR_VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
 
 
 # --- Exceptions --------------------------------------------------------------
@@ -192,8 +202,8 @@ def sha256_of_file(path: Path) -> str:
 def read_mc_version_from_history(server_dir: Path) -> tuple[str, int] | None:
     """Read the running MC version + Paper build from ``version_history.json``.
 
-    Paper writes ``version_history.json`` in the server directory after the first start; the file's
-    ``currentVersion`` field looks like ``"git-Paper-60 (MC: 1.21.8)"``.
+    Recognize both the older ``git-Paper-60 (MC: 1.21.8)`` form and the newer
+    ``1.21.11-69-94d0c97 (MC: 1.21.11)`` form.
 
     Args:
         server_dir: Paper server directory.
@@ -203,27 +213,31 @@ def read_mc_version_from_history(server_dir: Path) -> tuple[str, int] | None:
         / malformed.
     """
     history_path = server_dir / VERSION_HISTORY_FILE
-    if not history_path.exists():
-        return None
     try:
-        text = history_path.read_text(encoding="utf-8")
-    except OSError:
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    match = _VERSION_HISTORY_RE.search(text)
-    if not match:
+    if not isinstance(history, dict):
         return None
-    try:
-        build = int(match["build"])
-    except ValueError:
+    version = history.get("currentVersion")
+    if not isinstance(version, str):
         return None
-    return match["mc"].strip(), build
+    for pattern in _VERSION_HISTORY_PATTERNS:
+        match = pattern.fullmatch(version.strip())
+        if match:
+            mc_version = match["mc"].strip()
+            declared_mc = match.groupdict().get("declared_mc")
+            if not mc_version or (declared_mc is not None and declared_mc != mc_version):
+                return None
+            return mc_version, int(match["build"])
+    return None
 
 
 def read_plugin_version(jar_path: Path) -> str | None:
-    """Extract the ``version`` field from a plugin jar's ``plugin.yml``.
+    """Extract the ``version`` field from a plugin jar's YAML metadata.
 
-    Reads the jar's local ``plugin.yml`` entry via ``unzip -p``. ``unzip`` is in ``install.py``'s apt-install
-    list so it is always present after a fresh provision.
+    Read ``plugin.yml`` or ``paper-plugin.yml`` directly from the jar without requiring an external ``unzip``
+    executable.
 
     Real plugin.yml shapes (sampled from current upstream jars):
 
@@ -236,23 +250,22 @@ def read_plugin_version(jar_path: Path) -> str | None:
 
     Returns:
         The raw version string with surrounding quotes stripped (e.g. ``"2.10.0-SNAPSHOT"``,
-        ``"2.2.5-SNAPSHOT (b132-5a72b6a)"``, ``"5.9.1"``), or ``None`` when the jar lacks ``plugin.yml`` /
-        the version field, or ``unzip`` is not installed.
+        ``"2.2.5-SNAPSHOT (b132-5a72b6a)"``, ``"5.9.1"``), or ``None`` when the jar is unreadable or has no
+        recognizable version.
     """
-    if not shutil.which("unzip"):
+    try:
+        with zipfile.ZipFile(jar_path) as jar:
+            for name in ("plugin.yml", "paper-plugin.yml"):
+                try:
+                    text = jar.read(name).decode("utf-8")
+                except (KeyError, UnicodeDecodeError):
+                    continue
+                match = _PLUGIN_YML_VERSION_RE.search(text)
+                if match:
+                    return match["version"].strip().strip("'\"")
+    except (OSError, zipfile.BadZipFile):
         return None
-    proc = subprocess.run(  # noqa: S603 — argv as list, no shell.
-        ["unzip", "-p", str(jar_path), "plugin.yml"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    match = _PLUGIN_YML_VERSION_RE.search(proc.stdout)
-    if not match:
-        return None
-    return match["version"].strip().strip("'\"")
+    return None
 
 
 # --- Paper artifact metadata -------------------------------------------------
@@ -401,7 +414,7 @@ def _geyser_like_artifact_from_payload(project_label: str, api_base: str, payloa
     )
 
 
-# --- ViaVersion (Hangar) artifact metadata -----------------------------------
+# --- Hangar artifact metadata ------------------------------------------------
 
 
 def fetch_viaversion_artifact(version_name: str | None) -> JarArtifact:
@@ -441,6 +454,50 @@ def _viaversion_artifact_from_payload(payload: object) -> JarArtifact:
     Raises:
         DownloadError: When the payload shape is unexpected.
     """
+    return _hangar_artifact_from_payload(payload, label="viaversion", filename="ViaVersion.jar")
+
+
+def fetch_multiverse_artifact(component: str, version_name: str) -> JarArtifact:
+    """Fetch a pinned Multiverse plugin release from Hangar.
+
+    Args:
+        component: One of ``core``, ``inventories``, or ``portals``.
+        version_name: Explicit Hangar release name.
+
+    Returns:
+        Metadata for the pinned Paper-compatible plugin jar.
+
+    Raises:
+        DownloadError: When the component or version is invalid, the API fails, or the response is unexpected.
+    """
+    project = MULTIVERSE_PROJECTS.get(component)
+    if project is None:
+        raise DownloadError(f"unknown Multiverse component: {component!r}")
+    if _HANGAR_VERSION_RE.fullmatch(version_name) is None:
+        raise DownloadError(f"invalid Multiverse version: {version_name!r}")
+    project_name, filename = project
+    encoded_version = urllib.parse.quote(version_name, safe="")
+    payload = http_get_json(f"{HANGAR_API_BASE}/Multiverse/{project_name}/versions/{encoded_version}")
+    artifact = _hangar_artifact_from_payload(payload, label=f"multiverse-{component}", filename=filename)
+    if artifact.version != version_name:
+        raise DownloadError(f"Hangar returned version {artifact.version!r} instead of {version_name!r}")
+    return artifact
+
+
+def _hangar_artifact_from_payload(payload: object, *, label: str, filename: str) -> JarArtifact:
+    """Convert a Hangar version response to a Paper plugin artifact.
+
+    Args:
+        payload: Decoded JSON from a Hangar version endpoint.
+        label: Short plugin identifier for messages.
+        filename: Destination filename under the plugins directory.
+
+    Returns:
+        A populated ``JarArtifact`` with the API's download URL and SHA-256.
+
+    Raises:
+        DownloadError: When the response is missing its Paper download metadata.
+    """
     if not isinstance(payload, dict):
         raise DownloadError("Hangar version response was not an object")
     name = payload.get("name")
@@ -454,14 +511,14 @@ def _viaversion_artifact_from_payload(payload: object) -> JarArtifact:
     if not isinstance(file_info, dict):
         raise DownloadError(f"Hangar version {name!r}: PAPER entry missing fileInfo")
     sha256 = file_info.get("sha256Hash")
-    filename = file_info.get("name")
+    api_filename = file_info.get("name")
     download_url = entry.get("downloadUrl")
-    if not isinstance(sha256, str) or not isinstance(filename, str) or not isinstance(download_url, str):
+    if not isinstance(sha256, str) or not isinstance(api_filename, str) or not isinstance(download_url, str):
         raise DownloadError(f"Hangar version {name!r}: missing sha256 / name / downloadUrl")
     return JarArtifact(
-        label="viaversion",
+        label=label,
         version=name,
         download_url=download_url,
         sha256=sha256,
-        filename="ViaVersion.jar",
+        filename=filename,
     )

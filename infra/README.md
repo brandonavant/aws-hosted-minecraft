@@ -4,7 +4,11 @@ This layer manages the AWS resources that back the live LightSail Minecraft depl
 DynamoDB table created by `infra/bootstrap/` for remote state and locking.
 
 The configuration was reverse-engineered from a hand-built deployment (issue #4). The first apply imports existing
-resources rather than creating new ones; after that, the layer is the source of truth.
+resources rather than creating new ones; after that, the layer describes the intended running resources.
+
+**After manual instance deletion, do not apply this configuration without reconciliation.** It does not restore an
+instance snapshot and can create a fresh, empty instance. Snapshot restoration and archive-mode state management are
+not yet automated here; preserve and verify the data separately before planning a future restore.
 
 ## Operator vs. agent split
 

@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -28,9 +29,12 @@ from _common import (
     _paper_artifact_from_build_payload,
     _viaversion_artifact_from_payload,
     fetch_geyser_like_artifact,
+    fetch_multiverse_artifact,
     fetch_paper_artifact,
     fetch_viaversion_artifact,
+    http_download_to_file,
     read_mc_version_from_history,
+    read_plugin_version,
     sha256_of_file,
 )
 from install import (
@@ -40,6 +44,7 @@ from install import (
     DEFAULT_HEAP,
     DEFAULT_USER,
     EULA_CONTENT,
+    MULTIVERSE_DEFAULT_VERSIONS,
     SYSTEMD_UNIT_NAME,
     UPDATER_SCRIPT_NAME,
     FloodgateKeyMissingError,
@@ -62,6 +67,8 @@ from install import (
     ensure_systemd_unit,
     ensure_user,
     invoke_updater_install_systemd_units,
+    install,
+    install_multiverse_plugins,
     main,
     parse_os_release,
     render_start_script,
@@ -137,6 +144,38 @@ def test_read_mc_version_from_history_parses_real_shape(tmp_path: Path) -> None:
     assert result == ("1.21.8", 60)
 
 
+def test_read_mc_version_from_history_parses_current_paper_format(tmp_path: Path) -> None:
+    """Parse the format observed on the current production server.
+
+    Args:
+        tmp_path: Temporary server directory.
+    """
+    (tmp_path / "version_history.json").write_text(
+        '{"oldVersion":"1.21.11-113-6103cc7 (MC: 1.21.11)",' '"currentVersion":"1.21.11-69-94d0c97 (MC: 1.21.11)"}',
+        encoding="utf-8",
+    )
+    assert read_mc_version_from_history(tmp_path) == ("1.21.11", 69)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"currentVersion":"1.21.11-69-94d0c97 (MC: 1.21.10)"}',
+        '{"oldVersion":"git-Paper-60 (MC: 1.21.8)"}',
+        '{"currentVersion":"git-Paper-60 (MC: 1.21.8)"',
+    ],
+)
+def test_read_mc_version_from_history_rejects_mismatched_or_invalid_data(tmp_path: Path, content: str) -> None:
+    """Avoid using a mismatched Minecraft version, an old version, or malformed JSON.
+
+    Args:
+        tmp_path: Temporary server directory.
+        content: Invalid or mismatched history document.
+    """
+    (tmp_path / "version_history.json").write_text(content, encoding="utf-8")
+    assert read_mc_version_from_history(tmp_path) is None
+
+
 def test_read_mc_version_from_history_returns_none_when_missing(tmp_path: Path) -> None:
     """Missing ``version_history.json`` → ``None`` (not an error)."""
     assert read_mc_version_from_history(tmp_path) is None
@@ -146,6 +185,39 @@ def test_read_mc_version_from_history_returns_none_on_unrecognized_shape(tmp_pat
     """A file with no ``currentVersion`` field returns ``None``."""
     (tmp_path / "version_history.json").write_text('{"foo": "bar"}\n', encoding="utf-8")
     assert read_mc_version_from_history(tmp_path) is None
+
+
+@pytest.mark.parametrize("metadata", ["plugin.yml", "paper-plugin.yml"])
+def test_read_plugin_version_does_not_require_unzip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    """Read either plugin metadata file without an external executable.
+
+    Args:
+        tmp_path: Temporary directory for the jar.
+        monkeypatch: Pytest helper for adjusting the executable search path.
+        metadata: Metadata file to include in the jar.
+    """
+    jar_path = tmp_path / "plugin.jar"
+    with zipfile.ZipFile(jar_path, "w") as jar:
+        jar.writestr(metadata, 'name: Example\nversion: "5.4.0"\n')
+    monkeypatch.setenv("PATH", "")
+    assert read_plugin_version(jar_path) == "5.4.0"
+
+
+def test_read_plugin_version_handles_invalid_or_missing_metadata(tmp_path: Path) -> None:
+    """Return no version for corrupt jars or jars lacking plugin metadata.
+
+    Args:
+        tmp_path: Temporary directory for the jars.
+    """
+    invalid_jar = tmp_path / "invalid.jar"
+    invalid_jar.write_bytes(b"not a zip file")
+    missing_metadata = tmp_path / "missing.jar"
+    with zipfile.ZipFile(missing_metadata, "w") as jar:
+        jar.writestr("other.yml", "version: 1\n")
+    assert read_plugin_version(invalid_jar) is None
+    assert read_plugin_version(missing_metadata) is None
 
 
 # --- sha256_of_file ----------------------------------------------------------
@@ -347,7 +419,10 @@ HANGAR_VERSION_FIXTURE = {
                 "sizeBytes": 6000000,
                 "sha256Hash": "abcd1234",
             },
-            "downloadUrl": "https://hangarcdn.papermc.io/plugins/ViaVersion/ViaVersion/versions/5.9.1/PAPER/ViaVersion-5.9.1.jar",
+            "downloadUrl": (
+                "https://hangarcdn.papermc.io/plugins/ViaVersion/ViaVersion/versions/"
+                "5.9.1/PAPER/ViaVersion-5.9.1.jar"
+            ),
         }
     },
 }
@@ -378,6 +453,7 @@ def test_render_systemd_unit_substitutes_user_group_and_dir() -> None:
     rendered = render_systemd_unit(Path("/srv/minecraft/server"), "minecraft", "minecraft")
     assert "User=minecraft" in rendered
     assert "Group=minecraft" in rendered
+    assert "ConditionPathIsMountPoint=/srv/minecraft" in rendered
     assert "WorkingDirectory=/srv/minecraft/server" in rendered
     assert "ExecStart=/srv/minecraft/server/start.sh" in rendered
 
@@ -611,6 +687,104 @@ def test_download_and_place_jar_raises_on_checksum_mismatch(tmp_path: Path, monk
     assert not target.exists()
 
 
+def test_download_checksum_failure_preserves_existing_jar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the original jar when a replacement download fails verification.
+
+    Args:
+        tmp_path: Temporary destination directory.
+        monkeypatch: Pytest helper for replacing the download.
+    """
+    target = tmp_path / "paper.jar"
+    target.write_bytes(b"original")
+    artifact = JarArtifact("paper", "1.21.11-70", "https://example.test/jar", "0" * 64, "paper.jar")
+
+    def fake_download(url: str, dest: Path) -> None:
+        """Write corrupt bytes instead of contacting the server.
+
+        Args:
+            url: Requested download URL.
+            dest: Temporary download destination.
+        """
+        dest.write_bytes(b"corrupt")
+
+    monkeypatch.setattr("install.http_download_to_file", fake_download)
+    with pytest.raises(ChecksumMismatchError):
+        download_and_place_jar(artifact, target, owner_user="u", owner_group="g")
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_install_multiverse_refuses_to_replace_different_existing_jar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserve existing Multiverse jars instead of silently replacing them.
+
+    Args:
+        tmp_path: Temporary plugins directory.
+        monkeypatch: Pytest helper for replacing metadata and download calls.
+    """
+    existing = tmp_path / "Multiverse-Core.jar"
+    existing.write_bytes(b"existing")
+    attempted_downloads = mock.Mock()
+    monkeypatch.setattr("install.http_download_to_file", attempted_downloads)
+
+    def fake_fetch(component: str, version: str) -> JarArtifact:
+        """Return artifact metadata with a different expected hash.
+
+        Args:
+            component: Multiverse component identifier.
+            version: Requested pinned version.
+
+        Returns:
+            Artifact metadata for the selected component.
+        """
+        filename = {
+            "core": "Multiverse-Core.jar",
+            "inventories": "Multiverse-Inventories.jar",
+            "portals": "Multiverse-Portals.jar",
+        }[component]
+        return JarArtifact(component, version, "https://example.test/jar", "0" * 64, filename)
+
+    monkeypatch.setattr("install.fetch_multiverse_artifact", fake_fetch)
+    with pytest.raises(InstallError, match="refusing to replace"):
+        install_multiverse_plugins(tmp_path, MULTIVERSE_DEFAULT_VERSIONS, owner_user="u", owner_group="g")
+    assert existing.read_bytes() == b"existing"
+    attempted_downloads.assert_not_called()
+
+
+def test_preserved_jar_is_not_overwritten_if_it_appears_during_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leave a jar created by another process untouched during a download.
+
+    Args:
+        tmp_path: Temporary plugins directory.
+        monkeypatch: Pytest helper for replacing download and ownership commands.
+    """
+    target = tmp_path / "Multiverse-Core.jar"
+    payload = b"expected"
+    artifact = JarArtifact(
+        "core", "5.4.0", "https://example.test/jar", hashlib.sha256(payload).hexdigest(), target.name
+    )
+
+    def fake_download(url: str, dest: Path) -> None:
+        """Create a competing jar while writing the downloaded bytes.
+
+        Args:
+            url: Requested download URL.
+            dest: Temporary download destination.
+        """
+        dest.write_bytes(payload)
+        target.write_bytes(b"other process")
+
+    monkeypatch.setattr("install.http_download_to_file", fake_download)
+    monkeypatch.setattr("install.run_command", lambda *args, **kwargs: subprocess.CompletedProcess([], 0))
+    with pytest.raises(InstallError, match="appeared during download"):
+        download_and_place_jar(artifact, target, owner_user="u", owner_group="g", preserve_existing=True)
+    assert target.read_bytes() == b"other process"
+    assert list(tmp_path.iterdir()) == [target]
+
+
 # --- resolve_versions --------------------------------------------------------
 
 
@@ -690,6 +864,20 @@ def test_argument_parser_accepts_mc_version_and_dry_run() -> None:
     assert args.mc_version == "1.21.8"
     assert args.paper_build == 60
     assert args.dry_run is True
+
+
+def test_multiverse_installation_is_opt_in_and_requires_explicit_opt_in_for_version_flags() -> None:
+    """Keep Multiverse opt-in and reject version overrides without the opt-in.
+
+    Default installs must not fetch or replace Multiverse artifacts.
+    """
+    parser = build_argument_parser()
+    assert parser.parse_args([]).with_multiverse is False
+    with pytest.raises(PreflightError, match="require --with-multiverse"):
+        install(parser.parse_args(["--multiverse-core-version", "5.4.0"]))
+    args = parser.parse_args(["--with-multiverse", "--multiverse-core-version", "5.4.1"])
+    assert args.with_multiverse is True
+    assert args.multiverse_core_version == "5.4.1"
 
 
 # --- main() error mapping ----------------------------------------------------
@@ -836,3 +1024,33 @@ def test_e2e_viaversion_latest_returns_usable_artifact() -> None:
     assert artifact.sha256 and len(artifact.sha256) == 64
     assert artifact.download_url.startswith("https://")
     assert artifact.filename == "ViaVersion.jar"
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    ("component", "version", "filename"),
+    [
+        ("core", "5.4.0", "Multiverse-Core.jar"),
+        ("inventories", "5.3.0", "Multiverse-Inventories.jar"),
+        ("portals", "5.1.1", "Multiverse-Portals.jar"),
+    ],
+)
+def test_e2e_pinned_multiverse_artifact_downloads_and_verifies(
+    tmp_path: Path, component: str, version: str, filename: str
+) -> None:
+    """Fetch and verify each pinned Multiverse release using the real Hangar API.
+
+    Args:
+        tmp_path: Temporary directory for the downloaded jar.
+        component: Multiverse component identifier.
+        version: Pinned release name.
+        filename: Expected destination filename.
+    """
+    artifact = fetch_multiverse_artifact(component, version)
+    assert artifact.version == version
+    assert artifact.filename == filename
+    assert artifact.download_url.startswith("https://")
+    target = tmp_path / filename
+    http_download_to_file(artifact.download_url, target)
+    assert sha256_of_file(target) == artifact.sha256
+    assert read_plugin_version(target) == version

@@ -13,9 +13,13 @@ Idempotent: every mutation step inspects current state and skips when the desire
 Re-running converges to the same end state without error. ``--dry-run`` prints every mutation the script would
 perform.
 
-Pin policy: Paper, Geyser, Floodgate, and ViaVersion versions are pinned via CLI flags. Defaults read from the
-data volume (Paper from ``version_history.json``; plugins from each jar's ``plugin.yml``). The script never
-auto-bumps versions; that is the future nightly updater's job.
+Pin policy: Paper defaults to the data volume's ``version_history.json`` when no Minecraft version is supplied.
+Geyser, Floodgate, and ViaVersion default to their latest releases unless explicitly pinned. Re-running this
+installer on a restored volume can therefore replace those jars; restore from the snapshot instead when preserving
+the existing server.
+
+Multiverse installation is opt-in. Its default versions match the observed production jars, and existing
+Multiverse jars are never overwritten.
 
 CRITICAL: ``plugins/floodgate/key.pem`` must be preserved across rebuilds. The script refuses to proceed if it is
 absent (override with ``--allow-fresh-floodgate-key`` for a brand-new environment where Floodgate will generate
@@ -30,6 +34,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,11 +42,13 @@ from pathlib import Path
 from _common import (
     FLOODGATE_API_BASE,
     GEYSER_API_BASE,
+    MULTIVERSE_PROJECTS,
     VERSION_HISTORY_FILE,
     ChecksumMismatchError,
     DownloadError,
     JarArtifact,
     fetch_geyser_like_artifact,
+    fetch_multiverse_artifact,
     fetch_paper_artifact,
     fetch_viaversion_artifact,
     http_download_to_file,
@@ -71,6 +78,11 @@ CORRETTO_REPO_PATH = Path("/etc/apt/sources.list.d/corretto.list")
 CORRETTO_REPO_LINE = "deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main\n"
 JAVA_PACKAGE = "java-21-amazon-corretto-jdk"
 COMMON_PACKAGES: tuple[str, ...] = ("unzip", "wget", "ca-certificates", "gnupg")
+MULTIVERSE_DEFAULT_VERSIONS: dict[str, str] = {
+    "core": "5.4.0",
+    "inventories": "5.3.0",
+    "portals": "5.1.1",
+}
 
 SYSTEMD_UNIT_PATH = Path("/etc/systemd/system/minecraft.service")
 SYSTEMD_UNIT_NAME = "minecraft.service"
@@ -85,6 +97,7 @@ SYSTEMD_UNIT_TEMPLATE = """\
 Description=Minecraft Paper Server (Paper + Geyser + Floodgate)
 After=network-online.target
 Wants=network-online.target
+ConditionPathIsMountPoint={data_root}
 
 [Service]
 Type=simple
@@ -578,11 +591,12 @@ def download_and_place_jar(
     owner_user: str,
     owner_group: str,
     dry_run: bool = False,
+    preserve_existing: bool = False,
 ) -> bool:
     """Download ``artifact`` to ``dest`` if missing or sha256-mismatched.
 
-    Verifies the downloaded bytes against ``artifact.sha256`` and applies ownership. A pre-existing file with the
-    matching hash is left in place.
+    Verify downloaded bytes before atomically placing them. A pre-existing file with the matching hash is left
+    in place, and ``preserve_existing`` refuses to replace a different file.
 
     Args:
         artifact: Jar metadata.
@@ -590,6 +604,7 @@ def download_and_place_jar(
         owner_user: Owning user for the placed file.
         owner_group: Owning group for the placed file.
         dry_run: When true, log the planned download without performing it.
+        preserve_existing: Refuse to replace an existing jar with a different SHA-256.
 
     Returns:
         ``True`` when the jar was downloaded by this call, ``False`` when the existing file already matched.
@@ -597,27 +612,84 @@ def download_and_place_jar(
     Raises:
         ChecksumMismatchError: When the downloaded bytes do not match.
         DownloadError: When the HTTP fetch fails.
+        InstallError: When preserving an existing jar prevents the requested installation.
     """
     if dest.exists():
         observed = sha256_of_file(dest)
         if observed == artifact.sha256:
             print(f"[skip] {dest} already at sha256 {artifact.sha256[:12]}…", file=sys.stderr)
             return False
+        if preserve_existing:
+            raise InstallError(f"refusing to replace existing {dest}; its SHA-256 differs from {artifact.version}")
         print(f"[update] {dest} sha256 {observed[:12]}… → {artifact.sha256[:12]}…", file=sys.stderr)
     if dry_run:
         print(f"[dry-run] download {artifact.label} {artifact.version} → {dest}", file=sys.stderr)
         return True
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"[download] {artifact.label} {artifact.version} → {dest}", file=sys.stderr)
-    http_download_to_file(artifact.download_url, dest)
-    observed = sha256_of_file(dest)
-    if observed != artifact.sha256:
-        dest.unlink()
-        raise ChecksumMismatchError(
-            f"{artifact.label} {artifact.version}: expected sha256 {artifact.sha256}, got {observed}"
+    descriptor, staging_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".stage", dir=dest.parent)
+    os.close(descriptor)
+    staging = Path(staging_name)
+    try:
+        http_download_to_file(artifact.download_url, staging)
+        observed = sha256_of_file(staging)
+        if observed != artifact.sha256:
+            raise ChecksumMismatchError(
+                f"{artifact.label} {artifact.version}: expected sha256 {artifact.sha256}, got {observed}"
+            )
+        run_command(["chown", f"{owner_user}:{owner_group}", str(staging)])
+        if preserve_existing:
+            try:
+                os.link(staging, dest)
+            except FileExistsError:
+                if sha256_of_file(dest) == artifact.sha256:
+                    print(f"[skip] {dest} appeared with the expected SHA-256", file=sys.stderr)
+                    return False
+                raise InstallError(f"refusing to replace existing {dest}; it appeared during download") from None
+        else:
+            staging.replace(dest)
+        return True
+    finally:
+        staging.unlink(missing_ok=True)
+        staging.with_suffix(staging.suffix + ".partial").unlink(missing_ok=True)
+
+
+def install_multiverse_plugins(
+    plugins_dir: Path,
+    versions: dict[str, str],
+    *,
+    owner_user: str,
+    owner_group: str,
+    dry_run: bool = False,
+) -> None:
+    """Install pinned Multiverse jars without replacing any existing different jar.
+
+    Args:
+        plugins_dir: Existing plugins directory on the data volume.
+        versions: Pinned version for every Multiverse component.
+        owner_user: Owning user for newly installed jars.
+        owner_group: Owning group for newly installed jars.
+        dry_run: When true, report intended downloads without writing files.
+
+    Raises:
+        InstallError: When an existing Multiverse jar differs from the requested pinned version.
+        DownloadError: When Hangar metadata cannot be fetched or validated.
+        ChecksumMismatchError: When a downloaded jar does not match its published SHA-256.
+    """
+    artifacts = [fetch_multiverse_artifact(component, versions[component]) for component in MULTIVERSE_PROJECTS]
+    for artifact in artifacts:
+        dest = plugins_dir / artifact.filename
+        if dest.exists() and sha256_of_file(dest) != artifact.sha256:
+            raise InstallError(f"refusing to replace existing {dest}; its SHA-256 differs from {artifact.version}")
+    for artifact in artifacts:
+        download_and_place_jar(
+            artifact,
+            plugins_dir / artifact.filename,
+            owner_user=owner_user,
+            owner_group=owner_group,
+            dry_run=dry_run,
+            preserve_existing=True,
         )
-    run_command(["chown", f"{owner_user}:{owner_group}", str(dest)])
-    return True
 
 
 # --- Floodgate key check -----------------------------------------------------
@@ -738,7 +810,7 @@ def render_systemd_unit(server_dir: Path, user: str, group: str) -> str:
     Returns:
         Rendered unit content with a trailing newline.
     """
-    return SYSTEMD_UNIT_TEMPLATE.format(server_dir=server_dir, user=user, group=group)
+    return SYSTEMD_UNIT_TEMPLATE.format(server_dir=server_dir, data_root=server_dir.parent, user=user, group=group)
 
 
 def ensure_systemd_unit(
@@ -882,7 +954,7 @@ class ResolvedVersions:
 
 
 def resolve_versions(args: argparse.Namespace, paths: InstallPaths) -> ResolvedVersions:
-    """Pin every artifact's version, defaulting from the volume when available.
+    """Resolve Paper from the volume when needed and retain explicit plugin pins.
 
     Args:
         args: Parsed CLI arguments.
@@ -893,7 +965,7 @@ def resolve_versions(args: argparse.Namespace, paths: InstallPaths) -> ResolvedV
 
     Raises:
         VersionDiscoveryError: When ``--mc-version`` is not provided and the volume does not contain
-            ``version_history.json`` to discover from.
+            a recognizable ``version_history.json`` to discover from.
     """
     mc_version = args.mc_version
     paper_build: int | str = args.paper_build if args.paper_build is not None else "latest"
@@ -901,8 +973,8 @@ def resolve_versions(args: argparse.Namespace, paths: InstallPaths) -> ResolvedV
         discovered = read_mc_version_from_history(paths.server_dir)
         if discovered is None:
             raise VersionDiscoveryError(
-                "--mc-version is required when the data volume has no "
-                f"{paths.server_dir / VERSION_HISTORY_FILE} (brand-new environment). "
+                "--mc-version is required when the data volume has no recognizable "
+                f"{paths.server_dir / VERSION_HISTORY_FILE}. "
                 "Pass the MC version you want to install."
             )
         mc_version, discovered_build = discovered
@@ -934,6 +1006,13 @@ def install(args: argparse.Namespace) -> int:
     paths = InstallPaths.from_data_root(args.data_root)
 
     # Pre-flight.
+    multiverse_versions = {
+        "core": args.multiverse_core_version,
+        "inventories": args.multiverse_inventories_version,
+        "portals": args.multiverse_portals_version,
+    }
+    if not args.with_multiverse and any(version is not None for version in multiverse_versions.values()):
+        raise PreflightError("Multiverse version flags require --with-multiverse")
     assert_root()
     assert_ubuntu_2204(Path("/etc/os-release").read_text(encoding="utf-8"))
     if not args.skip_volume_check:
@@ -1020,6 +1099,17 @@ def install(args: argparse.Namespace) -> int:
         owner_group=args.minecraft_group,
         dry_run=args.dry_run,
     )
+    if args.with_multiverse:
+        install_multiverse_plugins(
+            paths.plugins_dir,
+            {
+                component: version if version is not None else MULTIVERSE_DEFAULT_VERSIONS[component]
+                for component, version in multiverse_versions.items()
+            },
+            owner_user=args.minecraft_user,
+            owner_group=args.minecraft_group,
+            dry_run=args.dry_run,
+        )
 
     # Configs + launcher.
     ensure_eula(paths, args.minecraft_user, args.minecraft_group, dry_run=args.dry_run)
@@ -1107,6 +1197,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--viaversion",
         help="Pin the ViaVersion Hangar version name (default: latest Release-channel build).",
     )
+    parser.add_argument(
+        "--with-multiverse",
+        action="store_true",
+        help="Install the three pinned Multiverse plugins if missing; never replace different existing jars.",
+    )
+    for component in MULTIVERSE_PROJECTS:
+        parser.add_argument(
+            f"--multiverse-{component}-version",
+            help=(
+                f"Pin Multiverse {component} (default with --with-multiverse: "
+                f"{MULTIVERSE_DEFAULT_VERSIONS[component]})."
+            ),
+        )
     parser.add_argument(
         "--allow-fresh-floodgate-key",
         action="store_true",
