@@ -252,6 +252,7 @@ infra/aws-inventory.*.json
 # and Floodgate sections). Kept locally as an input reference for
 # scripts/server/install.py; never committed.
 server/state.md
+server/state*.json
 
 # Real backend configuration — bucket / table / profile names are operator-specific.
 # Only the *.hcl.example template is committed; copy it to *.hcl and fill in your

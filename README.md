@@ -1,9 +1,8 @@
 # aws-hosted-minecraft
 
 An AWS LightSail-hosted Minecraft server — Paper + Geyser + Floodgate + ViaVersion for Java/Bedrock crossplay — with
-infrastructure managed by Terraform and on-host operations captured in idempotent scripts. Fork this repo, point it
-at a fresh AWS account, fill in a few `.env` values, and bring up an equivalent server end to end without re-deriving
-any of the steps.
+infrastructure modeled in Terraform and on-host operations captured in scripts. The configuration reflects the
+original deployment; restoring an archived server and reconciling its Terraform state are not yet automated.
 
 ## What you get
 
@@ -16,12 +15,15 @@ any of the steps.
 - **Firewall** — Java Edition on TCP 25565, Bedrock Edition on UDP 19132 (IPv4 + IPv6), HTTP on TCP 80, and SSH on
   TCP 22 restricted to LightSail Connect's range plus the operator's current public IPv4 (auto-detected via
   `api.ipify.org` at plan time, or pinned explicitly via `ssh_allowed_cidrs`). IPv6 SSH is intentionally closed.
-- **Backups** — LightSail AutoSnapshot scheduled daily.
+- **Backups** — Terraform enables daily LightSail automatic snapshots while the instance exists. AWS deletes an
+  instance's automatic snapshots when the instance is deleted; retain a manual snapshot independently.
 - **Server stack** — Paper (Java edition core), Geyser + Floodgate (Bedrock-client crossplay without separate
   accounts), and ViaVersion (protocol bridging so older clients stay compatible across Mojang version bumps).
-- **Nightly auto-update** — an on-host systemd timer that bumps Paper / Geyser / Floodgate / ViaVersion when upstream
-  ships new builds, with sha256-based skip-when-unchanged behavior and hard refusal to bump Paper across Minecraft
-  versions or to overwrite the Floodgate key.
+- **Worlds** — the observed deployment has the standard dimension worlds plus hub and creative worlds, managed by
+  Multiverse Core, Inventories, and Portals. World data, plugin configuration, and player data live on the data disk.
+- **Nightly auto-update** — an on-host systemd timer updates Paper / Geyser / Floodgate / ViaVersion with
+  sha256-based skip-when-unchanged behavior. Paper stays on the installed Minecraft version, and the Floodgate key is
+  never overwritten. Multiverse is excluded and must be maintained manually.
 
 ## Repo layout
 
@@ -32,7 +34,7 @@ any of the steps.
 | `scripts/aws/`      | Operator-facing AWS scripts: credential verification, drift inventory.             |
 | `scripts/server/`   | On-host scripts: provisioner, updater, `deploy-updater.sh`, tests.                 |
 | `docs/`             | Long-form operator walkthroughs (currently: AWS CLI auth via IAM Identity Center). |
-| `server/`           | Reserved for on-host server state captures (placeholder).                          |
+| `server/`           | Gitignored operator-specific server state captures.                                |
 | `.claude/`          | Project rules and skills used by Claude Code.                                      |
 
 Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-setup.md`, carry the depth.
@@ -48,14 +50,21 @@ Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-se
    outputs, then `terraform init -backend-config=backend-configs/prod.hcl`. The committed `.tf` files describe the
    live deployment shape, so the supported path today is the import workflow in `infra/README.md`; a clean greenfield
    apply has not been exercised end to end and may surface differences that need reconciling.
-4. **Provision the host** — once Terraform has the LightSail instance up and the data volume is attached and mounted
-   at `/srv/minecraft`, SSH in and run the provisioner. It is idempotent (re-runs are no-ops when state matches),
-   pins Paper / Geyser / Floodgate / ViaVersion versions via flags (defaulting to the volume's existing state), and
-   refuses to regenerate the Floodgate key unless `--allow-fresh-floodgate-key` is passed:
+4. **Provision a new host** — once Terraform has the LightSail instance up and the data volume is attached and mounted
+   at `/srv/minecraft`, use a checkout on the host to run the provisioner. It refuses to proceed without the
+   Floodgate key unless `--allow-fresh-floodgate-key` is passed for a new environment. Paper defaults to the version
+   recorded on the volume; Geyser, Floodgate, and ViaVersion default to their latest releases unless pinned:
 
    ```bash
    sudo python3 scripts/server/install.py --help
    ```
+
+   Multiverse installation is opt-in via `--with-multiverse`, with captured defaults of Core `5.4.0`, Inventories
+   `5.3.0`, and Portals `5.1.1`. The individual `--multiverse-*-version` flags override these historical pins; check
+   compatibility before using them. Existing different Multiverse jars are not replaced.
+
+   **Do not run the provisioner blindly on a restored server.** Its defaults can replace existing plugins, and it
+   starts services. Restore and verify the snapshot's existing server data instead.
 
 5. **Deploy the nightly updater** — from the operator workstation, run `scripts/server/deploy-updater.sh` (reads
    `.env` for SSH details, rsyncs `update.py` + `_common.py` to `/usr/local/sbin/`, then installs the systemd timer
@@ -75,9 +84,43 @@ Per-directory READMEs in `infra/` and `infra/bootstrap/`, plus `docs/aws-auth-se
 - `scripts/server/update.py --help` — the on-host updater (lands at `/usr/local/sbin/minecraft-update.py`). Runs
   daily under `minecraft-update.timer` (fires at `*-*-* 10:00:00 UTC` with a `RandomizedDelaySec=3600` jitter —
   ~5 AM CDT, genuine off-peak). Sha256-driven: skips when on-disk jars match the API. Refuses to bump Paper across
-  Minecraft versions; never touches `plugins/floodgate/key.pem`.
+  Minecraft versions; never touches `plugins/floodgate/key.pem`. The repository version recognizes both older and
+  newer Paper version-history formats; an existing host keeps its previously deployed updater until redeployed.
 - `scripts/server/deploy-updater.sh --help` — operator-side script for redeploying the updater payload + systemd
   units to an existing host without re-running `install.py`.
+- `sudo python3 scripts/server/capture_state.py` — on a host with the data disk mounted, print a read-only inventory
+  of recognized plugin versions and fingerprints, world names, selected server properties, and configuration/key
+  presence. Raw configs, player lists, and key contents are omitted. The output is still operator-specific; if saved
+  in a local checkout, use a private `server/state*.json` file, which is gitignored.
+
+## Archiving and restoring
+
+A manual instance snapshot can preserve the attached data disk as well as the instance, but check the snapshot's
+disk list and availability before relying on it. A snapshot taken while Minecraft is running is not proof of
+application-level consistency. Keep an independent copy, such as the original data disk, until a separate restore
+has been verified, including the worlds, player data, Multiverse configuration, and the existing Floodgate key.
+Restoring an instance may automatically start Minecraft and its persistent updater timer; this repository has no
+tested mechanism to hold them before first boot. Retained disks and snapshots continue to incur AWS charges.
+
+This repository does not yet automate restoring an instance snapshot or reconciling Terraform after manual deletion.
+**Do not run a normal `terraform apply` after deleting the instance:** the current configuration describes a new
+instance, not a snapshot restore, and may recreate an empty server. Review and reconcile the infrastructure and state
+before any future apply. Do not generate or replace `plugins/floodgate/key.pem`.
+
+If a future host has an existing ext4 data filesystem that needs mounting, identify its filesystem UUID on that host
+using a read-only inspection such as `lsblk -f` or `sudo blkid`. From the host's checkout, preview and then run the
+mount helper with that UUID:
+
+```bash
+sudo python3 scripts/server/mount_data.py --uuid YOUR-FILESYSTEM-UUID --dry-run
+sudo python3 scripts/server/mount_data.py --uuid YOUR-FILESYSTEM-UUID
+```
+
+The helper does not format disks; it refuses ambiguous UUIDs, conflicting mounts, conflicting target or UUID fstab
+entries, and a nonempty unmounted target. Snapshot clones can share a filesystem UUID, so do not attach multiple copies
+with the same UUID and expect the helper to choose one. The generated Minecraft service checks that the data
+directory is a mountpoint before starting; an existing host receives that guard only if its service unit is updated
+separately.
 
 ## License
 

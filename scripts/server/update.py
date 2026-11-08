@@ -542,6 +542,7 @@ def build_plan(
     Raises:
         PaperMcVersionMismatchError: When the API's latest Paper crosses MC versions or exceeds
             ``--max-paper-build``.
+        UpdateError: When the Paper artifact label is invalid or would downgrade the installed build.
         DownloadError: From the API fetch.
     """
     plans: list[ComponentPlan] = []
@@ -553,15 +554,18 @@ def build_plan(
         if component == COMPONENT_PAPER:
             history = read_mc_version_from_history(paths.server_dir)
             if history is None:
-                log(f"[skip] paper: no version_history.json yet (server hasn't booted) — try again tomorrow")
+                log(f"[skip] paper: cannot read or recognize {paths.server_dir / 'version_history.json'}")
                 continue
-            installed_mc, _installed_build = history
+            installed_mc, installed_build = history
             cli_overrides_with_mc = {**cli_overrides, "paper_mc_version": installed_mc}
             artifact = fetch_artifact_for(component, cli_overrides_with_mc)
             api_build = parse_trailing_dash_int(artifact.version)
+            api_mc, separator, _ = artifact.version.rpartition("-")
+            if not separator or api_build is None:
+                raise UpdateError(f"unrecognized Paper artifact version: {artifact.version!r}")
             assert_paper_same_mc(
                 installed_mc=installed_mc,
-                api_mc=installed_mc,
+                api_mc=api_mc,
                 max_build=(
                     cli_overrides.get("max_paper_build")
                     if isinstance(cli_overrides.get("max_paper_build"), int)
@@ -569,6 +573,8 @@ def build_plan(
                 ),
                 api_build=api_build,
             )
+            if api_build < installed_build:
+                raise UpdateError(f"refusing to downgrade Paper build {installed_build} to {api_build}")
         else:
             artifact = fetch_artifact_for(component, cli_overrides)
 
